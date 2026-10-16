@@ -13,6 +13,12 @@ struct LocationResult {
   String locType = "none";
 };
 
+struct NeighborCell {
+  uint32_t lac = 0;
+  uint32_t cid = 0;
+  int16_t  dbm = -115;
+};
+
 struct CellTowerInfo {
   uint16_t mcc = 639;
   uint8_t  mnc = 2;
@@ -20,6 +26,8 @@ struct CellTowerInfo {
   uint32_t cid = 0;
   int16_t  csq = 0;
   int16_t  rssiDbm = -115;
+  uint8_t  neighborCount = 0;
+  NeighborCell neighbors[7];
 };
 
 namespace location {
@@ -33,6 +41,22 @@ inline uint32_t lastNvsSaveMs = 0;
 inline float speedKmh() { return speedMps_ * 3.6f; }
 inline float heading()  { return headingDeg_; }
 inline void  setCachedPosition(double lat, double lon) { cached.lat = lat; cached.lon = lon; }
+
+inline int readBatteryPercent() {
+  String resp = modem::sendAT("AT+CBC", 1500);
+  int idx = resp.indexOf("+CBC:");
+  if (idx == -1) return 0;
+
+  int firstComma = resp.indexOf(',', idx);
+  int secondComma = resp.indexOf(',', firstComma + 1);
+  if (firstComma == -1 || secondComma == -1) return 0;
+
+  String val = resp.substring(secondComma + 1);
+  int end = val.indexOf('\r');
+  if (end != -1) val = val.substring(0, end);
+  val.trim();
+  return val.toInt();
+}
 
 inline void saveToNvs(double lat, double lon) {
   uint32_t now = millis();
@@ -162,13 +186,13 @@ inline bool tryGetLbsFix(LocationResult &loc) {
 }
 
 inline void parseCellTowerId(const String &resp, CellTowerInfo &t) {
-  int q1 = resp.indexOf('\"');
+  int q1 = resp.indexOf('"');
   if (q1 == -1) return;
-  int q2 = resp.indexOf('\"', q1 + 1);
+  int q2 = resp.indexOf('"', q1 + 1);
   if (q2 == -1) return;
-  int q3 = resp.indexOf('\"', q2 + 1);
+  int q3 = resp.indexOf('"', q2 + 1);
   if (q3 == -1) return;
-  int q4 = resp.indexOf('\"', q3 + 1);
+  int q4 = resp.indexOf('"', q3 + 1);
   if (q4 == -1) return;
 
   t.lac = strtoul(resp.substring(q1 + 1, q2).c_str(), NULL, 16);
@@ -184,9 +208,103 @@ inline void parseSignalStrength(const String &resp, CellTowerInfo &t) {
   t.rssiDbm = (val == 99 || val == 0) ? -115 : (-113 + (val * 2));
 }
 
+inline void parseCengNeighbors(const String &resp, CellTowerInfo &t) {
+  t.neighborCount = 0;
+  if (resp.length() == 0) return;
+
+  String s = resp;
+  s.replace("\r", " ");
+  s.replace("\n", " ");
+
+  int searchPos = 0;
+  while (searchPos < s.length() && t.neighborCount < 7) {
+    int start = s.indexOf("+CENG:", searchPos);
+    if (start == -1) break;
+
+    int end = s.indexOf(' ', start + 6);
+    if (end == -1) end = s.length();
+    String line = s.substring(start, end);
+
+    int q1 = line.indexOf('"');
+    if (q1 != -1) {
+      int q2 = line.indexOf('"', q1 + 1);
+      int q3 = line.indexOf('"', q2 + 1);
+      int q4 = line.indexOf('"', q3 + 1);
+      if (q2 != -1 && q3 != -1 && q4 != -1) {
+        uint32_t lac = strtoul(line.substring(q1 + 1, q2).c_str(), NULL, 16);
+        uint32_t cid = strtoul(line.substring(q3 + 1, q4).c_str(), NULL, 16);
+        if (lac != 0 && cid != 0) {
+          bool duplicate = false;
+          for (uint8_t i = 0; i < t.neighborCount; ++i) {
+            if (t.neighbors[i].lac == lac && t.neighbors[i].cid == cid) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (!duplicate) {
+            t.neighbors[t.neighborCount].lac = lac;
+            t.neighbors[t.neighborCount].cid = cid;
+            t.neighbors[t.neighborCount].dbm = t.rssiDbm;
+            t.neighborCount++;
+          }
+        }
+      }
+    }
+
+    int values[16];
+    int numCount = 0;
+    int pos = 0;
+    while (pos < line.length() && numCount < 16) {
+      while (pos < line.length() && !isdigit((unsigned char)line.charAt(pos)) && line.charAt(pos) != '-' && line.charAt(pos) != '+') {
+        pos++;
+      }
+      if (pos >= line.length()) break;
+      int startVal = pos;
+      while (pos < line.length() && (isdigit((unsigned char)line.charAt(pos)) || line.charAt(pos) == '-' || line.charAt(pos) == '+')) {
+        pos++;
+      }
+      String token = line.substring(startVal, pos);
+      if (token.length() > 0) {
+        values[numCount++] = token.toInt();
+      }
+    }
+
+    if (numCount >= 8) {
+      for (int i = 3; i + 1 < numCount && t.neighborCount < 7; ++i) {
+        uint32_t lac = (uint32_t)labs(values[i]);
+        uint32_t cid = (uint32_t)labs(values[i + 1]);
+        if (lac > 0 && cid > 0 && lac < 65535 && cid < 65535) {
+          bool duplicate = false;
+          for (uint8_t j = 0; j < t.neighborCount; ++j) {
+            if (t.neighbors[j].lac == lac && t.neighbors[j].cid == cid) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (!duplicate) {
+            t.neighbors[t.neighborCount].lac = lac;
+            t.neighbors[t.neighborCount].cid = cid;
+            t.neighbors[t.neighborCount].dbm = (int16_t)values[i + 2];
+            t.neighborCount++;
+          }
+        }
+      }
+    }
+
+    searchPos = start + 6;
+  }
+}
+
 inline void updateServingCellTower() {
+  String cengResp = modem::sendAT("AT+CENG?", 500);
+  parseCengNeighbors(cengResp, tower);
   parseCellTowerId(modem::sendAT("AT+CREG?", 500), tower);
   parseSignalStrength(modem::sendAT("AT+CSQ", 500), tower);
+
+  if (tower.lac == 0 && tower.cid == 0 && tower.neighborCount > 0) {
+    tower.lac = tower.neighbors[0].lac;
+    tower.cid = tower.neighbors[0].cid;
+  }
 }
 
 inline LocationResult resolveBest() {
