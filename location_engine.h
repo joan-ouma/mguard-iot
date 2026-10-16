@@ -186,15 +186,16 @@ inline bool tryGetLbsFix(LocationResult &loc) {
 }
 
 inline void parseCellTowerId(const String &resp, CellTowerInfo &t) {
-  int q1 = resp.indexOf('"');
+  int q1 = resp.indexOf('\"');
   if (q1 == -1) return;
-  int q2 = resp.indexOf('"', q1 + 1);
+  int q2 = resp.indexOf('\"', q1 + 1);
   if (q2 == -1) return;
-  int q3 = resp.indexOf('"', q2 + 1);
+  int q3 = resp.indexOf('\"', q2 + 1);
   if (q3 == -1) return;
-  int q4 = resp.indexOf('"', q3 + 1);
+  int q4 = resp.indexOf('\"', q3 + 1);
   if (q4 == -1) return;
 
+  // CREG sometimes returns hex LAC/CID in quotes; fallback to numeric parse when needed
   t.lac = strtoul(resp.substring(q1 + 1, q2).c_str(), NULL, 16);
   t.cid = strtoul(resp.substring(q3 + 1, q4).c_str(), NULL, 16);
 }
@@ -208,99 +209,98 @@ inline void parseSignalStrength(const String &resp, CellTowerInfo &t) {
   t.rssiDbm = (val == 99 || val == 0) ? -115 : (-113 + (val * 2));
 }
 
+// Parse AT+CENG? response using SIMCom-like formats described by M2MSupport
 inline void parseCengNeighbors(const String &resp, CellTowerInfo &t) {
   t.neighborCount = 0;
   if (resp.length() == 0) return;
 
-  String s = resp;
-  s.replace("\r", " ");
-  s.replace("\n", " ");
+  int pos = 0;
+  while (pos < resp.length()) {
+    int lineStart = resp.indexOf("+CENG:", pos);
+    if (lineStart == -1) break;
+    // find end of line
+    int lineEnd = resp.indexOf('\r', lineStart);
+    if (lineEnd == -1) lineEnd = resp.length();
+    String line = resp.substring(lineStart, lineEnd);
 
-  int searchPos = 0;
-  while (searchPos < s.length() && t.neighborCount < 7) {
-    int start = s.indexOf("+CENG:", searchPos);
-    if (start == -1) break;
+    // extract index after +CENG:
+    int colon = line.indexOf(":");
+    int comma = line.indexOf(",", colon + 1);
+    String idxStr = (comma == -1) ? line.substring(colon + 1) : line.substring(colon + 1, comma);
+    idxStr.trim();
+    int entryIdx = idxStr.toInt();
 
-    int end = s.indexOf(' ', start + 6);
-    if (end == -1) end = s.length();
-    String line = s.substring(start, end);
-
+    // extract quoted payload if present
     int q1 = line.indexOf('"');
-    if (q1 != -1) {
-      int q2 = line.indexOf('"', q1 + 1);
-      int q3 = line.indexOf('"', q2 + 1);
-      int q4 = line.indexOf('"', q3 + 1);
-      if (q2 != -1 && q3 != -1 && q4 != -1) {
-        uint32_t lac = strtoul(line.substring(q1 + 1, q2).c_str(), NULL, 16);
-        uint32_t cid = strtoul(line.substring(q3 + 1, q4).c_str(), NULL, 16);
-        if (lac != 0 && cid != 0) {
-          bool duplicate = false;
+    int q2 = (q1 == -1) ? -1 : line.indexOf('"', q1 + 1);
+    String payload = (q1 != -1 && q2 != -1) ? line.substring(q1 + 1, q2) : (comma != -1 ? line.substring(comma + 1) : "");
+
+    // split payload by commas
+    String toks[16];
+    int tcount = 0;
+    int s = 0;
+    while (s < payload.length() && tcount < 16) {
+      int c = payload.indexOf(',', s);
+      if (c == -1) {
+        toks[tcount++] = payload.substring(s);
+        break;
+      }
+      toks[tcount++] = payload.substring(s, c);
+      s = c + 1;
+    }
+    for (int i = 0; i < tcount; ++i) toks[i].trim();
+
+    if (entryIdx == 0) {
+      // Serving cell format: <arfcn>,<rxl>,<rxq>,<mcc>,<mnc>,<bsic>,<cellid>,<rla>,<txp>,<lac>,<TA>
+      if (tcount >= 10) {
+        int rxl = toks[1].toInt();
+        int computedDbm = (rxl >= 0 && rxl <= 31) ? (-113 + (rxl * 2)) : t.rssiDbm;
+        // MCC/MNC at tokens 3,4
+        t.mcc = (uint16_t) toks[3].toInt();
+        t.mnc = (uint8_t) toks[4].toInt();
+        // cellid token 6 may be hex
+        t.cid = strtoul(toks[6].c_str(), NULL, 16);
+        t.lac = strtoul(toks[9].c_str(), NULL, 16);
+        if (computedDbm != t.rssiDbm) t.rssiDbm = computedDbm;
+      }
+    } else {
+      // Neighbor format: <arfcn>,<rxl>,<bsic>,<mcc>,<mnc>,<lac>
+      if (tcount >= 6 && t.neighborCount < 7) {
+        int rxl = toks[1].toInt();
+        int neighborDbm = (rxl >= 0 && rxl <= 31) ? (-113 + (rxl * 2)) : t.rssiDbm;
+        uint32_t lac = strtoul(toks[5].c_str(), NULL, 16);
+        uint32_t cid = 0; // neighbor CID not provided in this compact format
+        // mcc/mnc may be present at toks[3], toks[4]
+        // add neighbor if valid
+        if (lac != 0) {
+          bool dup = false;
           for (uint8_t i = 0; i < t.neighborCount; ++i) {
-            if (t.neighbors[i].lac == lac && t.neighbors[i].cid == cid) {
-              duplicate = true;
-              break;
-            }
+            if (t.neighbors[i].lac == lac && t.neighbors[i].cid == cid) { dup = true; break; }
           }
-          if (!duplicate) {
+          if (!dup) {
             t.neighbors[t.neighborCount].lac = lac;
             t.neighbors[t.neighborCount].cid = cid;
-            t.neighbors[t.neighborCount].dbm = t.rssiDbm;
+            t.neighbors[t.neighborCount].dbm = neighborDbm;
             t.neighborCount++;
           }
         }
       }
     }
 
-    int values[16];
-    int numCount = 0;
-    int pos = 0;
-    while (pos < line.length() && numCount < 16) {
-      while (pos < line.length() && !isdigit((unsigned char)line.charAt(pos)) && line.charAt(pos) != '-' && line.charAt(pos) != '+') {
-        pos++;
-      }
-      if (pos >= line.length()) break;
-      int startVal = pos;
-      while (pos < line.length() && (isdigit((unsigned char)line.charAt(pos)) || line.charAt(pos) == '-' || line.charAt(pos) == '+')) {
-        pos++;
-      }
-      String token = line.substring(startVal, pos);
-      if (token.length() > 0) {
-        values[numCount++] = token.toInt();
-      }
-    }
-
-    if (numCount >= 8) {
-      for (int i = 3; i + 1 < numCount && t.neighborCount < 7; ++i) {
-        uint32_t lac = (uint32_t)labs(values[i]);
-        uint32_t cid = (uint32_t)labs(values[i + 1]);
-        if (lac > 0 && cid > 0 && lac < 65535 && cid < 65535) {
-          bool duplicate = false;
-          for (uint8_t j = 0; j < t.neighborCount; ++j) {
-            if (t.neighbors[j].lac == lac && t.neighbors[j].cid == cid) {
-              duplicate = true;
-              break;
-            }
-          }
-          if (!duplicate) {
-            t.neighbors[t.neighborCount].lac = lac;
-            t.neighbors[t.neighborCount].cid = cid;
-            t.neighbors[t.neighborCount].dbm = (int16_t)values[i + 2];
-            t.neighborCount++;
-          }
-        }
-      }
-    }
-
-    searchPos = start + 6;
+    pos = lineEnd + 1;
   }
 }
 
 inline void updateServingCellTower() {
-  String cengResp = modem::sendAT("AT+CENG?", 500);
-  parseCengNeighbors(cengResp, tower);
-  parseCellTowerId(modem::sendAT("AT+CREG?", 500), tower);
+  // get CSQ first so we have a fallback rssi value
   parseSignalStrength(modem::sendAT("AT+CSQ", 500), tower);
+  // then parse CENG to populate serving and neighbors
+  String cengResp = modem::sendAT("AT+CENG?", 800);
+  parseCengNeighbors(cengResp, tower);
+  // finally, try to get explicit CREG-based LAC/CID if available
+  parseCellTowerId(modem::sendAT("AT+CREG?", 500), tower);
 
+  // fallback: if serving not set but neighbors found, use first neighbor as serving placeholder
   if (tower.lac == 0 && tower.cid == 0 && tower.neighborCount > 0) {
     tower.lac = tower.neighbors[0].lac;
     tower.cid = tower.neighbors[0].cid;
@@ -315,13 +315,6 @@ inline LocationResult resolveBest() {
   }
 
   speedMps_ = 0.0f;
-
-  // Note: AT+CIPGSMLOC conflicts with active TCP socket in CIPMUX=0 mode.
-  // Cell tower info (MCC, MNC, LAC, CID, CSQ) is provided in telemetry payload for backend resolution.
-  // if (tryGetLbsFix(loc)) {
-  //   loc.speedKmh = 0.0f;
-  //   return loc;
-  // }
 
   updateServingCellTower();
 
